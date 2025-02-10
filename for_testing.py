@@ -233,14 +233,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test AGC")
     parser.add_argument("--files-per-sample", "-n", type=int, default=1, help="Number of files per sample")
     parser.add_argument("--chunksize", "-c", type=int, default=200000, help="Chunksize")
+    parser.add_argument("--n-workers", "-w", type=int, default=1, help="Number of workers")
     parser.add_argument("--force", "-f", action="store_true", help="Force recompute")
     args = parser.parse_args()
 
-    cluster = LocalCluster(n_workers=1, threads_per_worker=1)
+    cluster = LocalCluster(n_workers=args.n_workers, threads_per_worker=1)
     client = Client(cluster)
 
     N_FILES_MAX_PER_SAMPLE = args.files_per_sample
     chunksize = args.chunksize
+    print(f"Using chunksize {chunksize}")
     force = args.force
     print(f"Using {N_FILES_MAX_PER_SAMPLE} files per sample")
     print(f"Using chunksize {chunksize}")
@@ -255,14 +257,20 @@ if __name__ == "__main__":
         # compared to coffea 0.7: list of file paths becomes list of dicts (path: trename)
         fileset = utils.file_input.construct_fileset(N_FILES_MAX_PER_SAMPLE)
 
+        t0 = time.monotonic()
         samples, _ = dataset_tools.preprocess(fileset, step_size=chunksize)
+        proc_time = time.monotonic() - t0
+        print(f"\npreprocessing took {proc_time:.2f} seconds")
 
         # workaround for https://github.com/CoffeaTeam/coffea/issues/1050 (metadata gets dropped, already fixed)
         for k, v in samples.items():
             v["metadata"] = fileset[k]["metadata"]
 
         print("Creating tasks")
+        t0 = time.monotonic()
         tasks = dataset_tools.apply_to_fileset(create_histograms, samples, uproot_options={"allow_read_errors_with_report": True})
+        t_time = time.monotonic() - t0
+        print(f"\ncreating tasks took {t_time:.2f} seconds")
 
         print("Computing tasks")
         t0 = time.monotonic()
@@ -271,6 +279,20 @@ if __name__ == "__main__":
         print(f"\nexecution took {exec_time:.2f} seconds")
         with open(f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}.pkl", "wb") as f:
             pickle.dump(out, f)
+
+        # dump information into a csv file
+        print("Dumping information into a csv file")
+        import csv
+        log_file = "report.csv"
+        file_exists = os.path.isfile(log_file)
+        from datetime import datetime
+        timestamp = datetime.now().isoformat()
+        with open(log_file, mode='a') as f:
+            fieldnames = ['timestamp', 'n_files', 'n_workers', 'execution_time', 'chunksize']
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(fieldnames)
+            writer.writerow([timestamp, N_FILES_MAX_PER_SAMPLE, args.n_workers, exec_time, chunksize])
 
     # histograms
     full_histogram_4j1b = sum([v["4j1b"] for v in out.values()])
