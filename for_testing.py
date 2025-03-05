@@ -14,6 +14,7 @@ import coffea
 import numpy as np
 import uproot
 from dask.distributed import Client, LocalCluster
+from dask_jobqueue import SLURMCluster
 
 from coffea.nanoevents import NanoEventsFactory, NanoAODSchema
 from coffea.analysis_tools import PackedSelection
@@ -139,14 +140,16 @@ def calculate_m_reco_top(jets):
 # create histograms with observables
 def create_histograms(events):
     hist_4j1b = (
-        hist.dask.Hist.new.Reg(25, 50, 550, name="HT", label=r"$H_T$ [GeV]")
+        #hist.dask.Hist.new.Reg(25, 50, 550, name="HT", label=r"$H_T$ [GeV]")
+        hist.dask.Hist.new.Reg(11, 110, 550, name="HT", label=r"$H_T$ [GeV]")
         .StrCat([], name="process", label="Process", growth=True)
         .StrCat([], name="variation", label="Systematic variation", growth=True)
         .Weight()
     )
 
     hist_4j2b = (
-        hist.dask.Hist.new.Reg(25, 50, 550, name="m_reco_top", label=r"$m_{bjj}$ [GeV]")
+        #hist.dask.Hist.new.Reg(25, 50, 550, name="m_reco_top", label=r"$m_{bjj}$ [GeV]")
+        hist.dask.Hist.new.Reg(11, 110, 550, name="m_reco_top", label=r"$m_{bjj}$ [GeV]")
         .StrCat([], name="process", label="Process", growth=True)
         .StrCat([], name="variation", label="Systematic variation", growth=True)
         .Weight()
@@ -212,7 +215,8 @@ def create_histograms(events):
                     syst_var_name = f"{syst_var}_{direction}"
                     hist_dict[region].fill(
                         observable,
-                        process=process_label,
+                        #process=process_label,
+                        process=process,
                         variation=syst_var_name,
                         weight=region_weights * wgt_variation,
                     )
@@ -221,7 +225,8 @@ def create_histograms(events):
                     syst_var_name = variation
                 hist_dict[region].fill(
                     observable,
-                    process=process_label,
+                    #process=process_label,
+                    process=process,
                     variation=syst_var_name,
                     weight=region_weights,
                 )
@@ -238,7 +243,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cluster = LocalCluster(n_workers=args.n_workers, threads_per_worker=1)
+    #cluster = SLURMCluster(
+    #    queue="short",
+    #    #queue="standard",
+    #    #walltime="5:00:00",
+    #    cores=1,
+    #    processes=1,
+    #    memory="6G",
+    #    #log_directory="slurm_logs",
+    #    #local_directory="slurm_logs",
+    #)
+    cluster.adapt(minimum=args.n_workers, maximum=args.n_workers)
     client = Client(cluster)
+    print("Waiting for workers")
+    client.wait_for_workers(args.n_workers)
 
     N_FILES_MAX_PER_SAMPLE = args.files_per_sample
     chunksize = args.chunksize
@@ -256,6 +274,7 @@ if __name__ == "__main__":
     else:
         # compared to coffea 0.7: list of file paths becomes list of dicts (path: trename)
         fileset = utils.file_input.construct_fileset(N_FILES_MAX_PER_SAMPLE)
+        print(fileset.keys())
 
         t0 = time.monotonic()
         samples, _ = dataset_tools.preprocess(fileset, step_size=chunksize)
@@ -268,6 +287,7 @@ if __name__ == "__main__":
 
         print("Creating tasks")
         t0 = time.monotonic()
+        t0_tot = time.monotonic()
         tasks = dataset_tools.apply_to_fileset(create_histograms, samples, uproot_options={"allow_read_errors_with_report": True})
         t_time = time.monotonic() - t0
         print(f"\ncreating tasks took {t_time:.2f} seconds")
@@ -276,6 +296,7 @@ if __name__ == "__main__":
         t0 = time.monotonic()
         ((out, report),) = dask.compute(tasks)
         exec_time = time.monotonic() - t0
+        exec_time_tot = time.monotonic() - t0_tot
         print(f"\nexecution took {exec_time:.2f} seconds")
         with open(f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}.pkl", "wb") as f:
             pickle.dump(out, f)
@@ -284,19 +305,28 @@ if __name__ == "__main__":
         print("Dumping information into a csv file")
         import csv
         log_file = "report.csv"
+        #log_file = "report_distributed.csv"
         file_exists = os.path.isfile(log_file)
         from datetime import datetime
         timestamp = datetime.now().isoformat()
-        with open(log_file, mode='a') as f:
-            fieldnames = ['timestamp', 'n_files', 'n_workers', 'execution_time', 'chunksize']
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(fieldnames)
-            writer.writerow([timestamp, N_FILES_MAX_PER_SAMPLE, args.n_workers, exec_time, chunksize])
+        #with open(log_file, mode='a') as f:
+        #    fieldnames = ['timestamp', 'n_files', 'n_workers', 'execution_time', 'chunksize']
+        #    writer = csv.writer(f)
+        #    if not file_exists:
+        #        writer.writerow(fieldnames)
+        #    writer.writerow([timestamp, N_FILES_MAX_PER_SAMPLE, args.n_workers, exec_time, chunksize])
+        #    #writer.writerow([timestamp, N_FILES_MAX_PER_SAMPLE, args.n_workers, exec_time_tot, chunksize])
 
     # histograms
     full_histogram_4j1b = sum([v["4j1b"] for v in out.values()])
     full_histogram_4j2b = sum([v["4j2b"] for v in out.values()])
+
+    # dump for stats inference with also pseudodata
+    print("Saving histograms to ROOT file with pseudodata")
+    #hist_dct = {"4j1b": full_histogram_4j1b, "4j2b": full_histogram_4j2b}
+    #utils.file_output.save_histograms(hist_dct, f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}.root")
+    for region, histogram in [("bin4j1b", full_histogram_4j1b), ("bin4j2b", full_histogram_4j2b)]:
+        utils.file_output.save_histograms(histogram, f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}_{region}.root")
 
     fig_dir = Path.cwd() / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -323,7 +353,8 @@ if __name__ == "__main__":
     plt.close(fig)
 
     # b-tagging variations
-    ttbar_label = '$t\\bar{t}$'
+    #ttbar_label = '$t\\bar{t}$'
+    ttbar_label = "ttbar"
     fig, ax = plt.subplots()
     full_histogram_4j1b[120j::hist.rebin(2), ttbar_label, "nominal"].plot(label="nominal", linewidth=2)
     full_histogram_4j1b[120j::hist.rebin(2), ttbar_label, "btag_var_0_up"].plot(label="NP 1", linewidth=2)
