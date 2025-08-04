@@ -17,6 +17,7 @@ from dask.distributed import Client, LocalCluster
 from dask_jobqueue import SLURMCluster
 
 from coffea.nanoevents import NanoEventsFactory, NanoAODSchema
+from coffea.processor import ProcessorABC, Runner, IterativeExecutor, DaskExecutor
 from coffea.analysis_tools import PackedSelection
 from coffea import dataset_tools
 import correctionlib
@@ -32,12 +33,17 @@ NanoAODSchema.warn_missing_crossrefs = False # silences warnings about branches 
 
 
 def rand_gauss(item):
+    seeds = (
+        ak.flatten(ak.typetracer.length_one_if_typetracer(item)).to_numpy().view("i4")
+    )
+    randomstate = np.random.Generator(np.random.PCG64(seeds))
+
     def getfunction(layout, depth, **kwargs):
         if isinstance(layout, ak.contents.NumpyArray) or not isinstance(
             layout, (ak.contents.Content,)
         ):
             return ak.contents.NumpyArray(
-                np.random.normal(loc=1, scale=0.05, size=len(layout)).astype(np.float32)
+                randomstate.normal(loc=1, scale=0.05, size=len(layout)).astype(np.float32)
             )
         return None
 
@@ -132,101 +138,102 @@ def calculate_m_reco_top(jets):
     return observable
 
 
-# create histograms with observables
-def create_histograms(events):
-    hist_4j1b = (
-        #hist.dask.Hist.new.Reg(25, 50, 550, name="HT", label=r"$H_T$ [GeV]")
-        hist.dask.Hist.new.Reg(11, 110, 550, name="HT", label=r"$H_T$ [GeV]")
-        .StrCat([], name="process", label="Process", growth=True)
-        .StrCat([], name="variation", label="Systematic variation", growth=True)
-        .Weight()
-    )
-
-    hist_4j2b = (
-        #hist.dask.Hist.new.Reg(25, 50, 550, name="m_reco_top", label=r"$m_{bjj}$ [GeV]")
-        hist.dask.Hist.new.Reg(11, 110, 550, name="m_reco_top", label=r"$m_{bjj}$ [GeV]")
-        .StrCat([], name="process", label="Process", growth=True)
-        .StrCat([], name="variation", label="Systematic variation", growth=True)
-        .Weight()
-    )
-
-    hist_dict = {"4j1b": hist_4j1b, "4j2b": hist_4j2b}
-
-    process = events.metadata["process"]  # "ttbar" etc.
-    variation = events.metadata["variation"]  # "nominal" etc.
-    process_label = events.metadata["process_label"]  # nicer LaTeX labels
-
-    # normalization for MC
-    x_sec = events.metadata["xsec"]
-    nevts_total = events.metadata["nevts"]
-    lumi = 3378 # /pb
-    if process != "data":
-        xsec_weight = x_sec * lumi / nevts_total
-    else:
-        xsec_weight = 1
-
-    events["pt_scale_up"] = 1.03
-    events["pt_res_up"] = dak.map_partitions(rand_gauss, events.Jet.pt)
-
-    syst_variations = ["nominal"]
-    jet_kinematic_systs = ["pt_scale_up", "pt_res_up"]
-    event_systs = [f"btag_var_{i}" for i in range(4)]
-    if process == "wjets":
-        event_systs.append("scale_var")
+class create_histograms(ProcessorABC):
+    # create histograms with observables
+    def process(self, events):
+        hist_4j1b = (
+            hist.Hist.new.Reg(11, 110, 550, name="HT", label=r"$H_T$ [GeV]")
+            .StrCat([], name="process", label="Process", growth=True)
+            .StrCat([], name="variation", label="Systematic variation", growth=True)
+            .Weight()
+        )
     
-    if variation == "nominal":
-        syst_variations.extend(jet_kinematic_systs)
-        syst_variations.extend(event_systs)
+        hist_4j2b = (
+            hist.Hist.new.Reg(11, 110, 550, name="m_reco_top", label=r"$m_{bjj}$ [GeV]")
+            .StrCat([], name="process", label="Process", growth=True)
+            .StrCat([], name="variation", label="Systematic variation", growth=True)
+            .Weight()
+        )
     
-    for syst_var in syst_variations:
-        elecs = events.Electron
-        muons = events.Muon
-        jets = events.Jet
-
-        if syst_var in jet_kinematic_systs:
-            jets["pt"] = jets.pt * events[syst_var]
+        hist_dict = {"4j1b": hist_4j1b, "4j2b": hist_4j2b}
     
-        elecs, muons, jets = object_selection(elecs, muons, jets)
-
-        # region selection
-        selections = region_selection(elecs, muons, jets)
-
-        for region in ["4j1b", "4j2b"]:
-            selection = selections.all(region)
-            region_jets = jets[selection]
-            region_weights = dak.ones_like(dak.num(region_jets, axis=1)) * xsec_weight
-            if region == "4j1b":
-                observable = ak.sum(region_jets.pt, axis=-1)
-            elif region == "4j2b":
-                observable = calculate_m_reco_top(region_jets)
-            syst_var_name = f"{syst_var}"
-            if syst_var in event_systs:
-                for i_dir, direction in enumerate(["up", "down"]):
-                    if syst_var == "scale_var":
-                        wgt_variation = cset["event_systematics"].evaluate("scale_var", direction, region_jets.pt[:, 0])
-                    elif syst_var.startswith("btag_var"):
-                        i_jet = int(syst_var.rsplit("_",1)[-1])
-                        wgt_variation = cset["event_systematics"].evaluate("btag_var", direction, region_jets.pt[:,i_jet])
-                    syst_var_name = f"{syst_var}_{direction}"
+        process = events.metadata["process"]  # "ttbar" etc.
+        variation = events.metadata["variation"]  # "nominal" etc.
+        #process_label = events.metadata["process_label"]  # nicer LaTeX labels
+    
+        # normalization for MC
+        x_sec = events.metadata["xsec"]
+        nevts_total = events.metadata["nevts"]
+        lumi = 3378 # /pb
+        if process != "data":
+            xsec_weight = x_sec * lumi / nevts_total
+        else:
+            xsec_weight = 1
+    
+        events["pt_scale_up"] = 1.03
+        #events["pt_res_up"] = rand_gauss(events.Jet.pt)
+        events["pt_res_up"] = utils.systematics.jet_pt_resolution(events.Jet.pt)
+    
+        syst_variations = ["nominal"]
+        jet_kinematic_systs = ["pt_scale_up", "pt_res_up"]
+        event_systs = [f"btag_var_{i}" for i in range(4)]
+        if process == "wjets":
+            event_systs.append("scale_var")
+        
+        if variation == "nominal":
+            syst_variations.extend(jet_kinematic_systs)
+            syst_variations.extend(event_systs)
+        
+        for syst_var in syst_variations:
+            elecs = events.Electron
+            muons = events.Muon
+            jets = events.Jet
+    
+            if syst_var in jet_kinematic_systs:
+                jets["pt"] = jets.pt * events[syst_var]
+        
+            elecs, muons, jets = object_selection(elecs, muons, jets)
+    
+            # region selection
+            selections = region_selection(elecs, muons, jets)
+    
+            for region in hist_dict:
+                selection = selections.all(region)
+                region_jets = jets[selection]
+                region_weights = ak.ones_like(ak.num(region_jets, axis=1)) * xsec_weight
+                if region == "4j1b":
+                    observable = ak.sum(region_jets.pt, axis=-1)
+                elif region == "4j2b":
+                    observable = calculate_m_reco_top(region_jets)
+                syst_var_name = f"{syst_var}"
+                if syst_var in event_systs:
+                    for i_dir, direction in enumerate(["up", "down"]):
+                        if syst_var == "scale_var":
+                            wgt_variation = cset["event_systematics"].evaluate("scale_var", direction, region_jets.pt[:, 0])
+                        elif syst_var.startswith("btag_var"):
+                            i_jet = int(syst_var.rsplit("_",1)[-1])
+                            wgt_variation = cset["event_systematics"].evaluate("btag_var", direction, region_jets.pt[:,i_jet])
+                        syst_var_name = f"{syst_var}_{direction}"
+                        hist_dict[region].fill(
+                            observable,
+                            process=process,
+                            variation=syst_var_name,
+                            weight=region_weights * wgt_variation,
+                        )
+                else:
+                    if variation != "nominal":
+                        syst_var_name = variation
                     hist_dict[region].fill(
                         observable,
-                        #process=process_label,
                         process=process,
                         variation=syst_var_name,
-                        weight=region_weights * wgt_variation,
+                        weight=region_weights,
                     )
-            else:
-                if variation != "nominal":
-                    syst_var_name = variation
-                hist_dict[region].fill(
-                    observable,
-                    #process=process_label,
-                    process=process,
-                    variation=syst_var_name,
-                    weight=region_weights,
-                )
+    
+        return {events.metadata["dataset"]: hist_dict}
 
-    return hist_dict
+    def postprocess(self, accumulator):
+        pass
 
 
 if __name__ == "__main__":
@@ -249,10 +256,10 @@ if __name__ == "__main__":
     #    #log_directory="slurm_logs",
     #    #local_directory="slurm_logs",
     #)
-    cluster.adapt(minimum=args.n_workers, maximum=args.n_workers)
+    #cluster.adapt(minimum=args.n_workers, maximum=args.n_workers)
     client = Client(cluster)
-    print("Waiting for workers")
-    client.wait_for_workers(args.n_workers)
+    #print("Waiting for workers")
+    #client.wait_for_workers(args.n_workers)
 
     N_FILES_MAX_PER_SAMPLE = args.files_per_sample
     chunksize = args.chunksize
@@ -265,45 +272,66 @@ if __name__ == "__main__":
 
     if os.path.exists(f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}.pkl") and not force:
         print("Loading histograms from disk")
-        with open(f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}.pkl", "rb") as f:
+        with open(f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}_virtualarrays.pkl", "rb") as f:
             out = pickle.load(f)
     else:
         # compared to coffea 0.7: list of file paths becomes list of dicts (path: trename)
         fileset = utils.file_input.construct_fileset(N_FILES_MAX_PER_SAMPLE, local=args.local)
         print(fileset.keys())
+        print(fileset["ttbar__nominal"])
+        #import subprocess
+        #for key, value in fileset.items():
+        #    print(key)
+        #    counter = 0
+        #    for f in value["files"]:
+        #        print(f)
+        #        if counter >= 5:
+        #            break
+        #        new_f_name = f.replace("https", "root")
+        #        last_two_parts = new_f_name.rsplit("/", 2)[-2:]
+        #        last_two_parts = "/".join(last_two_parts)
+        #        print(f"Last two parts: {last_two_parts}")
+        #        result = subprocess.run(['xrdcp', new_f_name, f"/scratch/gallim/240730_AGC/{last_two_parts}"], capture_output=True, text=True)
+        #        print("Exit code:", result.returncode)
+        #        print("Standard Output:\n", result.stdout)
+        #        counter += 1
 
         t0 = time.monotonic()
-        samples, _ = dataset_tools.preprocess(fileset, step_size=chunksize)
+        # Define Runner
+        run = Runner(
+            DaskExecutor(client=client, compression=None),
+            chunksize=chunksize,
+            skipbadfiles=True,
+            schema=NanoAODSchema,
+            savemetrics=True
+        )
+        # pre-process
+        samples = run.preprocess(fileset, treename="Events") # treename not needed with coffea master branch
         proc_time = time.monotonic() - t0
         print(f"\npreprocessing took {proc_time:.2f} seconds")
 
         # workaround for https://github.com/CoffeaTeam/coffea/issues/1050 (metadata gets dropped, already fixed)
-        for k, v in samples.items():
-            v["metadata"] = fileset[k]["metadata"]
+        #for k, v in samples.items():
+        #    v["metadata"] = fileset[k]["metadata"]
 
-        print("Creating tasks")
         t0 = time.monotonic()
-        t0_tot = time.monotonic()
-        tasks = dataset_tools.apply_to_fileset(create_histograms, samples, uproot_options={"allow_read_errors_with_report": True})
-        t_time = time.monotonic() - t0
-        print(f"\ncreating tasks took {t_time:.2f} seconds")
-
-        print("Computing tasks")
-        t0 = time.monotonic()
-        ((out, report),) = dask.compute(tasks)
+        # execute
+        tmp, report = run(samples, processor_instance=create_histograms())
+        # sort the key order to be the same as the initial fileset
+        out = {key: tmp[key] for key in fileset}
+        sorted(report["columns"])
         exec_time = time.monotonic() - t0
-        exec_time_tot = time.monotonic() - t0_tot
         print(f"\nexecution took {exec_time:.2f} seconds")
-        with open(f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}.pkl", "wb") as f:
+        with open(f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}_virtualarrays.pkl", "wb") as f:
             pickle.dump(out, f)
 
         # dump information into a csv file
         print("Dumping information into a csv file")
         import csv
-        #log_file = "report.csv"
-        log_file = "report_daskcfrvirtual.csv"
+        log_file = "report_virtualarrays.csv"
         if args.local:
-            log_file = "report_daskcfrvirtual_local.csv"
+            log_file = "report_virtualarrays_local.csv"
+        #log_file = "report_distributed.csv"
         file_exists = os.path.isfile(log_file)
         from datetime import datetime
         timestamp = datetime.now().isoformat()
@@ -312,19 +340,19 @@ if __name__ == "__main__":
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow(fieldnames)
-            #writer.writerow([timestamp, N_FILES_MAX_PER_SAMPLE, args.n_workers, exec_time, chunksize])
-            writer.writerow([timestamp, N_FILES_MAX_PER_SAMPLE, args.n_workers, exec_time_tot, chunksize])
+            writer.writerow([timestamp, N_FILES_MAX_PER_SAMPLE, args.n_workers, exec_time, chunksize])
+            #writer.writerow([timestamp, N_FILES_MAX_PER_SAMPLE, args.n_workers, exec_time_tot, chunksize])
 
     # histograms
     full_histogram_4j1b = sum([v["4j1b"] for v in out.values()])
     full_histogram_4j2b = sum([v["4j2b"] for v in out.values()])
 
     # dump for stats inference with also pseudodata
-    print("Saving histograms to ROOT file with pseudodata")
+    #print("Saving histograms to ROOT file with pseudodata")
     #hist_dct = {"4j1b": full_histogram_4j1b, "4j2b": full_histogram_4j2b}
     #utils.file_output.save_histograms(hist_dct, f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}.root")
-    for region, histogram in [("bin4j1b", full_histogram_4j1b), ("bin4j2b", full_histogram_4j2b)]:
-        utils.file_output.save_histograms(histogram, f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}_{region}.root")
+    #for region, histogram in [("bin4j1b", full_histogram_4j1b), ("bin4j2b", full_histogram_4j2b)]:
+    #    utils.file_output.save_histograms(histogram, f"all_histograms_fps{N_FILES_MAX_PER_SAMPLE}_{region}.root")
 
     fig_dir = Path.cwd() / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -337,7 +365,7 @@ if __name__ == "__main__":
     fig = ax.get_figure()
     ax.legend(frameon=False)
     ax.set_title(">= 4 jets, 1 b-tag")
-    fig.savefig(fig_dir / f"coffea_4j_1b_{N_FILES_MAX_PER_SAMPLE}.png", dpi=300)
+    fig.savefig(fig_dir / f"coffea_4j_1b_{N_FILES_MAX_PER_SAMPLE}_virtualarrays.png", dpi=300)
     plt.close(fig)
 
     artists = full_histogram_4j2b[:, :, "nominal"].stack("process")[::-1].plot(
@@ -347,7 +375,7 @@ if __name__ == "__main__":
     fig = ax.get_figure()
     ax.legend(frameon=False)
     ax.set_title(">= 4 jets, >= 2 b-tags")
-    fig.savefig(fig_dir / f"coffea_4j_2b_{N_FILES_MAX_PER_SAMPLE}.png", dpi=300)
+    fig.savefig(fig_dir / f"coffea_4j_2b_{N_FILES_MAX_PER_SAMPLE}_virtualarrays.png", dpi=300)
     plt.close(fig)
 
     # b-tagging variations
@@ -362,7 +390,7 @@ if __name__ == "__main__":
     ax.legend(frameon=False)
     ax.set_xlabel("$H_T$ [GeV]")
     ax.set_title("b-tagging variations")
-    fig.savefig(fig_dir / f"coffea_btag_variations_{N_FILES_MAX_PER_SAMPLE}.png", dpi=300)
+    fig.savefig(fig_dir / f"coffea_btag_variations_{N_FILES_MAX_PER_SAMPLE}_virtualarrays.png", dpi=300)
     plt.close(fig)
 
     # jet enrgy scale/resolution variations
@@ -373,5 +401,5 @@ if __name__ == "__main__":
     ax.legend(frameon=False)
     ax.set_xlabel("$m_{bjj}$ [GeV]")
     ax.set_title("jet energy scale/resolution variations")
-    fig.savefig(fig_dir / f"coffea_jet_kin_variations_{N_FILES_MAX_PER_SAMPLE}.png", dpi=300)
+    fig.savefig(fig_dir / f"coffea_jet_kin_variations_{N_FILES_MAX_PER_SAMPLE}_virtualarrays.png", dpi=300)
     plt.close(fig)
